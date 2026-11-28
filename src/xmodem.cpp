@@ -51,6 +51,9 @@
 #include "xmodem.h"
 #include "SPILock.h"
 #include <cstring>
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "modules/optional/KynoPlanGnss/EnrollmentStore.h"
+#endif
 
 #ifdef FSCom
 
@@ -62,6 +65,11 @@ bool XModemAdapter::isValidFilename(const char *name)
 {
     if (!name || name[0] == '\0')
         return false;
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // The enhanced-GNSS identity key file must never be readable or writable over file transfer.
+    if (kynoplan::EnrollmentStore::isProtectedPath(name))
+        return false;
+#endif
     const bool driveLetter = (name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z');
     if (driveLetter && name[1] == ':')
         return false;

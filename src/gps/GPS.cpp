@@ -39,6 +39,10 @@
 #include <hardware/watchdog.h>
 #endif
 
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "modules/optional/KynoPlanGnss/KynoPlanGnssHooks.h"
+#endif
+
 // GPS::setup() blocks the main loop for well over the RP2040 hardware watchdog window (8 s, fed only from loop()):
 // the u-blox M10 config alone is ~15 s of ACK waits and delays. Keep the watchdog fed while we wait on the module.
 static inline void feedWatchdogWhileWaiting()
@@ -110,6 +114,34 @@ HardwareSerial *GPS::_serial_gps = nullptr;
 std::unique_ptr<GPS> gps = nullptr;
 
 static GPSUpdateScheduling scheduling;
+
+// Thread cadence while not GPS_ACTIVE: how often runOnce() checks whether a search is due
+static constexpr int32_t GPS_WAKE_CHECK_INTERVAL_MS = 5000;
+
+#if defined(KYNOPLAN_GNSS_STREAM)
+static bool tapWanted = false;         // kynoplanGnssWantsReceiverAwake(), sampled once per runOnce()
+static bool tapHeldAwake = false;      // in GPS_IDLE only because a GNSS stream client wants NMEA
+static bool tapResleep = false;        // down() is re-sleeping after a stream ended, not ending a search
+static uint32_t tapWakeCheckDueMs = 0; // next wake check on the 5 s non-active cadence; 0 = due now (and GPS_ACTIVE)
+static uint32_t tapSpread = 0;         // own LCG for the drain spread, so random() draws match a build without the tap
+static bool tapHaveColdModel = false;  // tapColdModel holds the lock-time model from before the stream kept it warm
+static GPSUpdateScheduling::LockModel tapColdModel;
+
+// Warm searches during a stream keep the cadence; the cold model must come back for the searches after it
+static void tapHoldAwake()
+{
+    tapHeldAwake = true;
+    if (!tapHaveColdModel)
+        tapColdModel = scheduling.lockModel();
+    tapHaveColdModel = true;
+}
+
+void kynoplanGnssKick()
+{
+    if (gps && tapWakeCheckDueMs != 0) // an active search drains on its own cadence
+        gps->setIntervalFromNow(0);
+}
+#endif
 
 // A board can share one pin between an L76K standby and an Airoha RTC_INT (ThinkNode M5 v1.0/v2.0).
 #if defined(PIN_GPS_STANDBY) && defined(GPS_RTC_INT) && PIN_GPS_STANDBY == GPS_RTC_INT
@@ -1650,10 +1682,24 @@ void GPS::up()
 // We've finished a GPS search cycle (lock or timeout). Enter a low power state, potentially.
 void GPS::down()
 {
-    if (scheduling.hasValidFixSinceSearchStarted())
-        scheduling.informGotLock();
-    else
-        scheduling.informSearchFailed();
+#if defined(KYNOPLAN_GNSS_STREAM)
+    const bool searchEnded = !tapResleep; // a re-sleep after a stream must leave the lock prediction alone
+    tapResleep = tapHeldAwake = false;
+#else
+    const bool searchEnded = true;
+#endif
+    if (searchEnded) {
+        if (scheduling.hasValidFixSinceSearchStarted())
+            scheduling.informGotLock();
+        else
+            scheduling.informSearchFailed();
+    }
+#if defined(KYNOPLAN_GNSS_STREAM)
+    if (tapHaveColdModel && !tapWanted) {
+        scheduling.restoreLockModel(tapColdModel); // the next search is cold again: drop what warm searches taught
+        tapHaveColdModel = false;
+    }
+#endif
     uint32_t predictedSearchDuration = scheduling.predictedSearchDurationMs();
     uint32_t sleepTime = scheduling.msUntilNextSearch();
     uint32_t updateInterval = Default::getConfiguredOrDefaultMs(config.position.gps_update_interval);
@@ -1664,6 +1710,14 @@ void GPS::down()
     if (updateInterval <= GPS_UPDATE_ALWAYS_ON_THRESHOLD_MS || sleepTime == 0)
         setPowerState(GPS_IDLE);
 
+#if defined(KYNOPLAN_GNSS_STREAM)
+    else if (tapWanted) {
+        // Stay powered for the stream instead of sleeping; fixQual as after a sleep, so the next search runs the same
+        tapHoldAwake();
+        setPowerState(GPS_IDLE);
+        fixQual = 0;
+    }
+#endif
     else {
 // Check whether the GPS hardware is capable of GPS_SOFTSLEEP
 // If not, fallback to GPS_HARDSLEEP instead
@@ -1818,13 +1872,30 @@ int32_t GPS::runOnce()
     //   --> If we have a time and a location --> publishUpdate
     //   --> If we had a location before but don't now --> publishUpdate
     //   --> down()
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // Power the receiver for a stream without starting a search; re-sleep as down() would once it ends
+    tapWanted = kynoplanGnssWantsReceiverAwake(); // down() and whileActive() reuse this sample
+    if (tapWanted && (powerState == GPS_SOFTSLEEP || powerState == GPS_HARDSLEEP)) {
+        tapHoldAwake();
+        setPowerState(GPS_IDLE);
+    } else if (!tapWanted && tapHeldAwake && powerState == GPS_IDLE) {
+        tapResleep = true;
+        down();
+    }
+#endif
     if (whileActive()) {
         // if we have received valid NMEA claim we are connected
         setConnected();
     }
 
+    bool wakeCheckDue = true;
+#if defined(KYNOPLAN_GNSS_STREAM)
+    kynoplanGnssOnDrainEnd((uint32_t)Time::getMillisMonotonic()); // epoch timeouts are judged with the UART emptied
+    // Tap drains and kicks run this thread more often; wake checks stay on the 5 s ticks it would otherwise run at
+    wakeCheckDue = tapWakeCheckDueMs == 0 || Throttle::deadlinePassed(tapWakeCheckDueMs);
+#endif
     // If we're due for an update, wake the GPS
-    if (!config.position.fixed_position && powerState != GPS_ACTIVE && scheduling.isUpdateDue())
+    if (wakeCheckDue && !config.position.fixed_position && powerState != GPS_ACTIVE && scheduling.isUpdateDue())
         up();
 
     // quality of the previous fix. We set it to 0 when we go down, so it's a way
@@ -1912,7 +1983,20 @@ int32_t GPS::runOnce()
     // 9600bps is approx 1 byte per msec, so considering our buffer size we never need to wake more often than 200ms
     // if not awake we can run super infrequently (once every 5 secs?) to see if we need to wake.
     // The spread keeps drains from locking to the GPS's 1 s bursts, so NMEA arrival bounds tighten (NmeaTimeEstimator)
-    return (powerState == GPS_ACTIVE) ? GPS_THREAD_INTERVAL + (int32_t)random(16) : 5000;
+#if defined(KYNOPLAN_GNSS_STREAM)
+    if (powerState == GPS_ACTIVE) {
+        tapWakeCheckDueMs = 0;
+    } else {
+        // Track the 5 s wake-check phase; while streaming, drain before the UART fills, with upstream's spread
+        if (wakeCheckDue)
+            tapWakeCheckDueMs = Time::timerEndsAtMillis(GPS_WAKE_CHECK_INTERVAL_MS);
+        const uint32_t untilCheck = tapWakeCheckDueMs - Time::getMillis();
+        tapSpread = tapSpread * 1103515245u + 12345u;
+        const uint32_t cap = tapWanted ? GPS_THREAD_INTERVAL + (tapSpread >> 28) : GPS_WAKE_CHECK_INTERVAL_MS;
+        return (int32_t)(untilCheck < cap ? untilCheck : cap);
+    }
+#endif
+    return (powerState == GPS_ACTIVE) ? GPS_THREAD_INTERVAL + (int32_t)random(16) : GPS_WAKE_CHECK_INTERVAL_MS;
 }
 
 // clear the GPS rx/tx buffer as quickly as possible
@@ -2730,6 +2814,15 @@ bool GPS::whileActive()
     std::string debugmsg = "";
 #endif
     if (powerState != GPS_ACTIVE) {
+#if defined(KYNOPLAN_GNSS_STREAM)
+        // Awake for a stream only: the tap gets the bytes, the position and time logic sees nothing new
+        if (powerState == GPS_IDLE && tapWanted) {
+            const uint32_t tapMs = (uint32_t)Time::getMillisMonotonic();
+            while (_serial_gps->available() > 0)
+                kynoplanGnssOnNmeaByte((char)_serial_gps->read(), tapMs);
+            return false;
+        }
+#endif
         clearBuffer();
         return false;
     }
@@ -2751,8 +2844,14 @@ bool GPS::whileActive()
 
     // Consume what has piled up, then stamp the time just before seeing the buffer empty: the arrival bounds need both
     do {
+#if defined(KYNOPLAN_GNSS_STREAM)
+        const uint32_t tapMs = (uint32_t)Time::getMillisMonotonic();
+#endif
         while (_serial_gps->available() > 0) {
             int c = _serial_gps->read();
+#if defined(KYNOPLAN_GNSS_STREAM)
+            kynoplanGnssOnNmeaByte((char)c, tapMs);
+#endif
             UBXscratch[charsInBuf] = c;
 #if GPS_DEBUG
             debugmsg += vformat("%c", (c >= 32 && c <= 126) ? c : '.');
@@ -2813,6 +2912,10 @@ void GPS::enable()
 {
     // Clear the old scheduling info (reset the lock-time prediction)
     scheduling.reset();
+#if defined(KYNOPLAN_GNSS_STREAM)
+    tapHeldAwake = tapResleep = tapHaveColdModel = false; // fresh schedule: no stale hold, model or wake-check phase
+    tapWakeCheckDueMs = 0;
+#endif
 
     enabled = true;
     setInterval(GPS_THREAD_INTERVAL);

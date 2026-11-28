@@ -1,0 +1,24 @@
+micro-ecc, vendored for the KynoPlan GNSS module (RFC 6979 ECDSA P-256 signing).
+
+Upstream:  https://github.com/kmackay/micro-ecc
+Tag:       v1.0
+Commit:    d037ec89546fad14b5c4d5456c2e23a71e554966
+           (identical to the PlatformIO registry package kmackay/micro-ecc@1.0.0 for every file below)
+License:   BSD-2-Clause, LICENSE.txt (verbatim from upstream)
+
+Files:     LICENSE.txt uECC.h uECC_vli.h types.h platform-specific.inc curve-specific.inc asm_arm.inc
+           byte-identical to upstream.
+           uECC.c.inc = upstream uECC.c, renamed so it is compiled only through ../../KpUecc.cpp, with
+           rfc6979-byte-order.patch applied (patch -p1 against upstream uECC.c).
+Omitted:   asm_avr*.inc, asm_arm_mult_square*.inc (only used at uECC_OPTIMIZATION_LEVEL >= 3), examples, scripts,
+           build files. Configuration (P-256 only, level 2) is in ../../KpUeccConfig.h.
+
+Patch (rfc6979-byte-order.patch, uECC_sign_deterministic only; fixes 1-2 are the same as upstream PR #51):
+  1. bits2octets(h1): the HMAC-DRBG is seeded with int2octets(bits2int(h1) mod n), not the raw hash (RFC 6979 3.2 d/f).
+  2. k = bits2int(T): the candidate T is converted from big-endian octets; upstream copied the octets into native
+     words, which on little-endian CPUs reads T little-endian and does not reproduce RFC 6979 signatures.
+  3. Comment only: the function comment above uECC_sign_deterministic, which listed the two deviations fixed by 1-2,
+     now says the function follows RFC 6979 3.2.
+
+Host tests also compile uECC.c.inc a second time with uECC_WORD_SIZE 4 and no assembly
+(test/test_kynoplan_crypto/uecc_word32.cpp), unmodified, to cover the 32-bit word path the X1 uses.

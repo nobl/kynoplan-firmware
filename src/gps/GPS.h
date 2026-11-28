@@ -106,6 +106,9 @@ class GPS : private concurrency::OSThread
 #ifdef PIO_UNIT_TESTING
     friend class GpsTestShim; // native reply-parser tests
 #endif
+#if defined(KYNOPLAN_GNSS_STREAM)
+    friend void kynoplanGnssKick(); // reschedules this (privately inherited) thread
+#endif
   public:
     meshtastic_Position p = meshtastic_Position_init_default;
 

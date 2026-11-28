@@ -24,6 +24,9 @@
 #include "modules/StoreForwardModule.h"
 #endif
 #endif
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "modules/optional/KynoPlanGnss/KynoPlanGnssPort.h"
+#endif
 
 extern Allocator<meshtastic_QueueStatus> &queueStatusPool;
 extern Allocator<meshtastic_MqttClientProxyMessage> &mqttClientProxyMessagePool;
@@ -175,7 +178,12 @@ class MeshService
      * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep
      * a reference
      */
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // PhoneAPI passes its transport so the KynoPlan guard can refuse port-300 packets not from BLE.
+    void handleToRadio(meshtastic_MeshPacket &p, KynoplanToRadioTransport transport = KynoplanToRadioTransport::UNKNOWN);
+#else
     void handleToRadio(meshtastic_MeshPacket &p);
+#endif
 
     /// Transparent mode: hand a raw LoRa frame to the client without decrypting it. Takes ownership of p.
     void handleTransparentFromRadio(meshtastic_MeshPacket *p);

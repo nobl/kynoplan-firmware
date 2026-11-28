@@ -56,6 +56,10 @@
 #include "GPS.h"
 #endif
 
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "modules/optional/KynoPlanGnss/EnrollmentStore.h"
+#endif
+
 #include <RNG.h>      // CryptRNG, the seeded CSPRNG used as fallback for the session passkey
 #include <Throttle.h> // rollover-safe elapsed-time checks for the session passkey
 
@@ -650,6 +654,13 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     }
     case meshtastic_AdminMessage_delete_file_request_tag: {
         LOG_DEBUG("Client requests delete file: %s", r->delete_file_request);
+#if defined(KYNOPLAN_GNSS_STREAM)
+        // The enhanced-GNSS identity key file is removed only by factory reset.
+        if (kynoplan::EnrollmentStore::isProtectedPath(r->delete_file_request)) {
+            LOG_WARN("Refused delete of protected file");
+            break;
+        }
+#endif
 
 #ifdef FSCom
         spiLock->lock();

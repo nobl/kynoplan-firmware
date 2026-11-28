@@ -30,6 +30,17 @@
 #include "PortduinoGlue.h"
 #endif
 
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "Throttle.h"
+#include "modules/optional/KynoPlanGnss/KynoPlanGnssPort.h"
+const uint32_t kynoplanLocalOnlyGuardInstalled = 1;
+static uint32_t kynoplanGnssDropWarnMs = 0;
+static void warnKynoplanGnssDropped()
+{
+    LOG_WARN("Drop KynoPlan GNSS packet from client: accepted only from BLE PhoneAPI, addressed to this node");
+}
+#endif
+
 /*
 receivedPacketQueue - this is a queue of messages we've received from the mesh, which we are keeping to deliver to the phone.
 It is implemented with a FreeRTos queue (wrapped with a little RTQueue class) of pointers to MeshPacket protobufs (which were
@@ -290,8 +301,20 @@ void MeshService::injectAsReceived(meshtastic_MeshPacket &p)
  * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep a
  * reference
  */
+#if defined(KYNOPLAN_GNSS_STREAM)
+void MeshService::handleToRadio(meshtastic_MeshPacket &p, KynoplanToRadioTransport transport)
+#else
 void MeshService::handleToRadio(meshtastic_MeshPacket &p)
+#endif
 {
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // Fail closed before any field is rewritten: KynoPlan GNSS traffic must never be routed off this node.
+    if (kynoplanGnssPortPacket(p) && !kynoplanGnssClientPacketAllowed(p, nodeDB->getNodeNum(), transport)) {
+        Throttle::execute(&kynoplanGnssDropWarnMs, 60 * 1000, warnKynoplanGnssDropped);
+        (void)sendQueueStatusToPhone(router->getQueueStatus(), meshtastic_Routing_Error_NOT_AUTHORIZED, p.id);
+        return;
+    }
+#endif
     // Transparent mode: encrypted frames go to the radio as built. Decoded packets are only for this node (admin).
     if (config.lora.transparent_mode) {
         if (p.which_payload_variant == meshtastic_MeshPacket_encrypted_tag) {

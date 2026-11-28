@@ -37,6 +37,10 @@
 #include "platform/portduino/PortduinoGlue.h"
 #include "serialization/MeshPacketSerializer.h"
 #endif
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "modules/optional/KynoPlanGnss/KynoPlanGnssPort.h"
+const uint32_t kynoplanIngressGuardInstalled = 1;
+#endif
 #include <algorithm>
 
 // The size checks below budget for the tag that encryptPacketCCM actually appends, so the
@@ -561,6 +565,15 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
         return meshtastic_Routing_Error_BAD_REQUEST;
     } // should have already been handled by sendLocal
 
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // Device-originated egress; mesh ingress on the KynoPlan GNSS port is dropped in passesRoutingAuthGate/dispatchReceived.
+    if (kynoplanGnssPortPacket(*p)) {
+        LOG_ERROR("BUG! KynoPlan GNSS packet routed to the mesh, dropped");
+        packetPool.release(p);
+        return meshtastic_Routing_Error_NOT_AUTHORIZED;
+    }
+#endif
+
     // In transparent mode the client owns the air: nothing generated on-device goes out.
     if (config.lora.transparent_mode) {
         packetPool.release(p);
@@ -888,6 +901,13 @@ RoutingAuthVerdict passesRoutingAuthGate(meshtastic_MeshPacket *p)
         // decryptor. Never trust serialized local authentication metadata on that boundary.
         authCandidate.pki_encrypted = false;
         authCandidate.public_key.size = 0;
+#if defined(KYNOPLAN_GNSS_STREAM)
+        // Ahead of the signature check: verifying a signer creates or marks its NodeDB entry.
+        if (kynoplanGnssPortPacket(authCandidate)) {
+            LOG_DEBUG("Drop KynoPlan GNSS packet from mesh ingress");
+            return RoutingAuthVerdict::REJECT;
+        }
+#endif
 #if !(MESHTASTIC_EXCLUDE_PKI) && !(MESHTASTIC_EXCLUDE_XEDDSA)
         concurrency::LockGuard g(cryptLock);
         if (!checkXeddsaReceivePolicy(&authCandidate)) {
@@ -923,6 +943,14 @@ RoutingAuthVerdict passesRoutingAuthGate(meshtastic_MeshPacket *p)
     // Only an explicit unknown-channel result remains eligible for opaque relay.
     if (state == DecodeState::DECODE_OPAQUE)
         return RoutingAuthVerdict::OPAQUE_RELAY_ONLY;
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // Local-only port (SPEC 3.4): refused before PacketHistory, relay, modules, NodeDB and MQTT. An
+    // undecodable frame's port is unknowable, so opaque relay above cannot be refused here.
+    if (kynoplanGnssPortPacket(authCandidate)) {
+        LOG_DEBUG("Drop KynoPlan GNSS packet from mesh ingress");
+        return RoutingAuthVerdict::REJECT;
+    }
+#endif
     storeRoutingAuthCache(wire, authCandidate);
     return RoutingAuthVerdict::ACCEPT;
 }
@@ -1069,6 +1097,13 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
                     LOG_WARN("Refusing pending-key decrypt of port %u from 0x%08x", (unsigned)decodedtmp.portnum, p->from);
                     return DecodeState::DECODE_FAILURE;
                 }
+#if defined(KYNOPLAN_GNSS_STREAM)
+                // Local-only port: refused before the admin-key commit and the signer check touch NodeDB.
+                if ((uint32_t)decodedtmp.portnum == KYNOPLAN_GNSS_PORTNUM) {
+                    LOG_DEBUG("Drop PKI KynoPlan GNSS packet from 0x%08x", p->from);
+                    return DecodeState::DECODE_POLICY_REJECT;
+                }
+#endif
                 decrypted = true;
                 rawSize = payloadSize; // commit the overhead subtraction only on full success
                 LOG_INFO("Packet decrypted using PKI");
@@ -1154,6 +1189,11 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
         // parsing was successful
         p->channel = chIndex; // change to store the index instead of the hash
 
+#if defined(KYNOPLAN_GNSS_STREAM)
+        // Local-only port: refused before the signer check can create or mark the sender's NodeDB entry.
+        if (kynoplanGnssPortPacket(*p))
+            return DecodeState::DECODE_POLICY_REJECT;
+#endif
 #if !(MESHTASTIC_EXCLUDE_PKI) && !(MESHTASTIC_EXCLUDE_XEDDSA)
         // Run before merging local-only bitfield state into the decoded Data.
         if (!checkXeddsaReceivePolicy(p))
@@ -1632,6 +1672,14 @@ void Router::dispatchReceived(meshtastic_MeshPacket *p, RxSource src)
             cancelSending(p->from, p->id);
         skipHandle = true;
     } else if (decodedState == DecodeState::DECODE_SUCCESS) {
+#if defined(KYNOPLAN_GNSS_STREAM)
+        // Local-only port: modules see only RX_SRC_USER (the module also requires from == 0, i.e. a BLE client).
+        if (src != RX_SRC_USER && kynoplanGnssPortPacket(*p)) {
+            LOG_DEBUG("Drop KynoPlan GNSS packet, src=%d", (int)src);
+            packetPool.release(p_encrypted);
+            return;
+        }
+#endif
         // parsing was successful, queue for our recipient
         if (src == RX_SRC_LOCAL)
             printPacket("handleReceived(LOCAL)", p);

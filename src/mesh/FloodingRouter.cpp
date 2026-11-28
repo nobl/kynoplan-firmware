@@ -9,6 +9,10 @@
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "modules/optional/KynoPlanGnss/KynoPlanGnssPort.h"
+const uint32_t kynoplanDuplicateGuardInstalled = 1;
+#endif
 
 FloodingRouter::FloodingRouter() {}
 
@@ -114,6 +118,11 @@ bool FloodingRouter::reprocessPacket(const meshtastic_MeshPacket *p)
         if (decodedState != DecodeState::DECODE_SUCCESS && decodedState != DecodeState::DECODE_OPAQUE)
             return false;
     }
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // Local-only port: a duplicate is never relayed or ACKed and does not update NodeDB.
+    if (kynoplanGnssPortPacket(*p))
+        return false;
+#endif
 
     if (nodeDB)
         nodeDB->updateFrom(*p);

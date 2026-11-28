@@ -25,6 +25,20 @@ class GPSUpdateScheduling
     uint32_t elapsedSearchMs();   // How long have we been searching so far?
     uint32_t predictedSearchDurationMs(); // How long do we expect to spend searching for a lock?
 
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // The learned lock-time model, saved before a GNSS stream keeps the receiver warm and restored after it
+    struct LockModel {
+        uint32_t searchCount;
+        uint32_t predictedMsToGetLock;
+    };
+    LockModel lockModel() const { return {searchCount, predictedMsToGetLock}; }
+    void restoreLockModel(const LockModel &m)
+    {
+        searchCount = m.searchCount;
+        predictedMsToGetLock = m.predictedMsToGetLock;
+    }
+#endif
+
   private:
     void updateLockTimePrediction(); // Called from informGotLock
     bool searching = false;          // Set by the inform*() calls; never inferred from stamp ordering

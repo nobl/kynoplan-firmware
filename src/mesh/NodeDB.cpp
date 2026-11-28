@@ -43,6 +43,9 @@
 #if HAS_TRAFFIC_MANAGEMENT
 #include "modules/TrafficManagementModule.h"
 #endif
+#if defined(KYNOPLAN_GNSS_STREAM)
+#include "modules/optional/KynoPlanGnss/EnrollmentStore.h"
+#endif
 #include "xmodem.h"
 #include <ErriezCRC32.h>
 #include <algorithm>
@@ -1080,6 +1083,10 @@ void NodeDB::noteRfHear(const meshtastic_MeshPacket &mp)
 bool NodeDB::factoryReset(bool eraseBleBonds)
 {
     LOG_INFO("Factory reset");
+#if defined(KYNOPLAN_GNSS_STREAM)
+    // Wipe the in-RAM identity and latch the store read-only, so nothing re-persists it before the reboot.
+    kynoplan::EnrollmentStore::onFactoryReset();
+#endif
     // first, remove the "/prefs" (this removes most prefs)
     spiLock->lock();
     rmDir("/prefs"); // this uses spilock internally...

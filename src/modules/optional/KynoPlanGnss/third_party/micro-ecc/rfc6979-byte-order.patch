@@ -1,0 +1,78 @@
+--- a/uECC.c
++++ b/uECC.c
+@@ -1368,10 +1368,8 @@
+     HMAC_finish(hash_context, K, V);
+ }
+ 
+-/* Deterministic signing, similar to RFC 6979. Differences are:
+-    * We just use H(m) directly rather than bits2octets(H(m))
+-      (it is not reduced modulo curve_n).
+-    * We generate a value for k (aka T) directly rather than converting endianness.
++/* Deterministic signing per RFC 6979 3.2 (KynoPlan: bits2octets(H(m)) and k = bits2int(T) as in the RFC,
++   after micro-ecc PR #51; upstream used H(m) and T unconverted).
+ 
+    Layout of hash_context->tmp: <K> | <V> | (1 byte overlapped 0x00 or 0x01) / <HMAC pad> */
+ int uECC_sign_deterministic(const uint8_t *private_key,
+@@ -1387,34 +1385,44 @@
+     bitcount_t num_n_bits = curve->num_n_bits;
+     uECC_word_t tries;
+     unsigned i;
++    /* KynoPlan: RFC 6979 bits2octets(h1) = int2octets(bits2int(h1) mod n), after micro-ecc PR #51. */
++    wordcount_t num_n_bytes = BITS_TO_BYTES(num_n_bits);
++    uECC_word_t h1[uECC_MAX_WORDS];
++    uint8_t h1_octets[uECC_MAX_WORDS * uECC_WORD_SIZE];
++    bits2int(h1, message_hash, hash_size, curve);
++    if (uECC_vli_cmp_unsafe(curve->n, h1, num_n_words) != 1) {
++        uECC_vli_sub(h1, h1, curve->n, num_n_words);
++    }
++    uECC_vli_nativeToBytes(h1_octets, num_n_bytes, h1);
+     for (i = 0; i < hash_context->result_size; ++i) {
+         V[i] = 0x01;
+         K[i] = 0;
+     }
+ 
+-    /* K = HMAC_K(V || 0x00 || int2octets(x) || h(m)) */
++    /* K = HMAC_K(V || 0x00 || int2octets(x) || bits2octets(h1)) */
+     HMAC_init(hash_context, K);
+     V[hash_context->result_size] = 0x00;
+     HMAC_update(hash_context, V, hash_context->result_size + 1);
+     HMAC_update(hash_context, private_key, num_bytes);
+-    HMAC_update(hash_context, message_hash, hash_size);
++    HMAC_update(hash_context, h1_octets, num_n_bytes);
+     HMAC_finish(hash_context, K, K);
+ 
+     update_V(hash_context, K, V);
+ 
+-    /* K = HMAC_K(V || 0x01 || int2octets(x) || h(m)) */
++    /* K = HMAC_K(V || 0x01 || int2octets(x) || bits2octets(h1)) */
+     HMAC_init(hash_context, K);
+     V[hash_context->result_size] = 0x01;
+     HMAC_update(hash_context, V, hash_context->result_size + 1);
+     HMAC_update(hash_context, private_key, num_bytes);
+-    HMAC_update(hash_context, message_hash, hash_size);
++    HMAC_update(hash_context, h1_octets, num_n_bytes);
+     HMAC_finish(hash_context, K, K);
+ 
+     update_V(hash_context, K, V);
+ 
+     for (tries = 0; tries < uECC_RNG_MAX_TRIES; ++tries) {
+         uECC_word_t T[uECC_MAX_WORDS];
+-        uint8_t *T_ptr = (uint8_t *)T;
++        uint8_t T_octets[uECC_MAX_WORDS * uECC_WORD_SIZE];
++        uint8_t *T_ptr = T_octets;
+         wordcount_t T_bytes = 0;
+         for (;;) {
+             update_V(hash_context, K, V);
+@@ -1426,11 +1434,7 @@
+             }
+         }
+     filled:
+-        if ((bitcount_t)num_n_words * uECC_WORD_SIZE * 8 > num_n_bits) {
+-            uECC_word_t mask = (uECC_word_t)-1;
+-            T[num_n_words - 1] &=
+-                mask >> ((bitcount_t)(num_n_words * uECC_WORD_SIZE * 8 - num_n_bits));
+-        }
++        bits2int(T, T_octets, num_n_bytes, curve); /* KynoPlan: k = bits2int(T), big-endian (micro-ecc PR #51). */
+ 
+         if (uECC_sign_with_k(private_key, message_hash, hash_size, T, signature, curve)) {
+             return 1;
