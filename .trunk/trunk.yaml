@@ -142,6 +142,10 @@ lint:
     - linters: [ALL]
       paths:
         - bin/**
+    # Vendored micro-ecc stays byte-identical to its pinned upstream commit (see VENDORED.txt).
+    - linters: [ALL]
+      paths:
+        - src/modules/optional/KynoPlanGnss/third_party/**
     # Fake-NodeDB fixture JSONL files contain deterministic synthetic
     # public_key_hex (64-char hex) values that gitleaks misidentifies as
     # generic-api-key. These are not secrets - they're test fixtures
