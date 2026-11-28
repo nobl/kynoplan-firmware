@@ -1,0 +1,193 @@
+name: KynoPlan Verification
+
+# Fork-only gate for the KynoPlan Enhanced GNSS work: the whole native suite set (upstream's own sharded
+# runner, which includes the coverage-kynoplan shard), a strict KynoPlan suite check, and the X1 build.
+# It deliberately does not call main_matrix.yml (the full hardware build matrix).
+
+on:
+  pull_request:
+    branches: [develop, "feature/kynoplan-**"]
+    paths:
+      - "src/**"
+      - "test/**"
+      - "variants/native/**"
+      - "variants/nrf52840/**"
+      - "boards/**"
+      - "lib/**"
+      - "protobufs/**"
+      - "platformio.ini"
+      - "arch/**"
+      - "extra_scripts/**"
+      - "bin/run-tests.sh"
+      - "bin/test-shards.py"
+      - "bin/check-test-attribution.py"
+      - "bin/platformio-*.py"
+      - "version.properties"
+      - ".github/actions/**"
+      - ".github/workflows/test_native.yml"
+      - ".github/workflows/kynoplan_verify.yml"
+  push:
+    branches: [develop, "feature/kynoplan-**"]
+    paths:
+      - "src/**"
+      - "test/**"
+      - "variants/native/**"
+      - "variants/nrf52840/**"
+      - "boards/**"
+      - "lib/**"
+      - "protobufs/**"
+      - "platformio.ini"
+      - "arch/**"
+      - "extra_scripts/**"
+      - "bin/run-tests.sh"
+      - "bin/test-shards.py"
+      - "bin/check-test-attribution.py"
+      - "bin/platformio-*.py"
+      - "version.properties"
+      - ".github/actions/**"
+      - ".github/workflows/test_native.yml"
+      - ".github/workflows/kynoplan_verify.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: kynoplan-verify-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  X1_ENV: seeed_mesh_tracker_X1
+
+jobs:
+  native:
+    name: Native suites
+    if: github.repository_owner != 'meshtastic'
+    uses: ./.github/workflows/test_native.yml
+    permissions: # the called collector needs these for its test report
+      contents: read
+      actions: read
+      checks: write
+
+  kynoplan-suites:
+    name: KynoPlan suites (strict)
+    needs: native
+    if: ${{ !cancelled() && github.repository_owner != 'meshtastic' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report name
+        id: version
+        run: echo "long=$(./bin/buildinfo.py long)" >> "$GITHUB_OUTPUT"
+
+      - name: Download the merged native test report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: platformio-test-report-${{ steps.version.outputs.long }}
+
+      - name: Every coverage-kynoplan suite ran, nothing failed, nothing was skipped
+        env:
+          NATIVE_RESULT: ${{ needs.native.result }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import configparser, os, sys, xml.etree.ElementTree as ET
+
+          ini = configparser.ConfigParser(interpolation=None, strict=False)
+          ini.read("variants/native/portduino/platformio.ini")
+          expected = ini.get("env:coverage-kynoplan", "test_filter", fallback="").split()
+          errors = []
+          if not expected:
+              errors.append("no test_filter for [env:coverage-kynoplan]; nothing to verify is a failure")
+          if os.environ["NATIVE_RESULT"] != "success":
+              errors.append(f"native workflow result is {os.environ['NATIVE_RESULT']!r}, not 'success'")
+
+          seen, cases, skipped = {}, 0, 0
+          for suite in ET.parse("testreport.xml").getroot().iter("testsuite"):
+              n = int(suite.get("tests", "0"))
+              if n == 0:
+                  continue  # PlatformIO's per-variant placeholder rows carry no status
+              name = suite.get("name", "?")
+              bad = int(suite.get("failures", "0")) + int(suite.get("errors", "0"))
+              marked = sum(1 for c in suite.iter("testcase") if c.find("skipped") is not None)
+              skip = max(int(suite.get("skipped", "0")), marked)
+              cases += n
+              skipped += skip
+              if bad:
+                  errors.append(f"{name}: {bad} failed")
+              if skip:
+                  errors.append(f"{name}: {skip} skipped (a skipped case is not verification)")
+              env, _, base = name.partition(":")
+              if env == "coverage-kynoplan":
+                  seen[base] = seen.get(base, 0) + n
+
+          for s in expected:
+              if seen.get(s, 0) == 0:
+                  errors.append(f"coverage-kynoplan:{s} produced no test cases (missing or did not run)")
+
+          print(f"{cases} case(s) across the report; coverage-kynoplan: {len(seen)}/{len(expected)} suites with cases; {skipped} skipped")
+          if errors:
+              for e in errors:
+                  print(f"::error title=KynoPlan suites::{e}")
+              sys.exit(1)
+          print("RESULT: GREEN - every coverage-kynoplan suite ran; no failure or skip anywhere in the native report.")
+          PY
+
+  x1-build:
+    name: X1 firmware build
+    if: github.repository_owner != 'meshtastic'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        uses: ./.github/actions/setup-base
+
+      - name: Build ${{ env.X1_ENV }}
+        run: |
+          set -euo pipefail
+          platformio run -e "$X1_ENV" 2>&1 | tee build.log
+          # The flag must reach this image: without it the KynoPlan guards are not compiled in.
+          grep -q -- "-DKYNOPLAN_GNSS_STREAM" "variants/nrf52840/seeed_mesh_tracker_X1/platformio.ini" \
+            || { echo "::error title=X1 build::KYNOPLAN_GNSS_STREAM is not set for $X1_ENV"; exit 1; }
+          grep -q "nrf52_warm_region: guard OK" build.log \
+            || { echo "::error title=X1 build::warm-region guard did not report OK"; exit 1; }
+          ls .pio/build/"$X1_ENV"/firmware*.uf2 > /dev/null \
+            || { echo "::error title=X1 build::no UF2 produced"; exit 1; }
+          {
+            echo "## $X1_ENV"
+            grep -E "^(RAM|Flash):" build.log || true
+            grep "nrf52_warm_region" build.log | tail -1 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verdict:
+    # The one status to require in branch protection and to read in release readiness.
+    name: KynoPlan verification
+    needs: [native, kynoplan-suites, x1-build]
+    if: ${{ always() && github.repository_owner != 'meshtastic' }}
+    runs-on: ubuntu-slim
+    permissions: {}
+    steps:
+      - name: All parts passed
+        env:
+          NATIVE: ${{ needs.native.result }}
+          KYNOPLAN: ${{ needs.kynoplan-suites.result }}
+          X1: ${{ needs.x1-build.result }}
+        run: |
+          set -euo pipefail
+          echo "native=$NATIVE kynoplan-suites=$KYNOPLAN x1-build=$X1"
+          for r in "$NATIVE" "$KYNOPLAN" "$X1"; do
+            [ "$r" = "success" ] || { echo "::error title=KynoPlan verification::native=$NATIVE kynoplan-suites=$KYNOPLAN x1-build=$X1"; exit 1; }
+          done
+          echo "RESULT: GREEN"
